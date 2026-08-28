@@ -501,41 +501,278 @@ async def update_backup_channel_counter(client, added_count, group_title=""):
             except Exception as e:
                 await send_error_alert(client, "update_backup_channel_counter", e)
 # --- NUEVA FUNCIÓN CORREGIDA: LISTAR GRUPOS DESDE LA BASE DE DATOS ---
+# --- COMANDO INTERACTIVO DE GRUPOS DEL USERBOT ---
 @app.on_message(filters.command("grupos") & filters.private)
-async def listar_grupos_activos(client, message):
-    if not is_authorized(message.from_user.id): return
+async def grupos_userbot_interactive_cmd(client, message):
+    if not is_authorized(message.from_user.id): 
+        return
     
-    msg_estado = await message.reply("⏳ Consultando registros de grupos en la base de datos...")
+    if not user_bot:
+        await message.reply("⚠️ **Error:** El UserBot no está configurado o no se ha iniciado (`USER_SESSION_STRING` vacía).")
+        return
+
+    msg_estado = await message.reply("⏳ Conectando con la cuenta de usuario para escanear grupos y chats activos...")
     
     try:
-        cursor.execute("SELECT DISTINCT group_id FROM scan_checkpoint UNION SELECT DISTINCT group_id FROM scanned_chats")
-        rows = cursor.fetchall()
-        
-        if not rows:
-            await msg_estado.edit_text("ℹ️ El bot aún no tiene registros de grupos activos en la base de datos.\n*(Un grupo se registra automáticamente al ejecutar un escaneo o cuando el bot se une).*")
+        # Asegurarnos de que el UserBot esté conectado
+        if not user_bot.is_connected:
+            await user_bot.start()
+
+        chats_list = []
+        # Recorremos los diálogos de la cuenta del UserBot con validación estricta
+        async for dialog in user_bot.get_dialogs():
+            chat = dialog.chat
+            # Filtramos solo grupos, supergrupos y canales relevantes
+            if chat.type in ["group", "supergroup"]:
+                chats_list.append((chat.title or "Grupo sin nombre", chat.id))
+
+        if not chats_list:
+            await msg_estado.edit_text("ℹ️ La cuenta de usuario no pertenece a ningún grupo o supergrupo activo actualmente.")
             return
-            
-        texto_grupos = "📋 **Grupos registrados en la Base de Datos:**\n\n"
+
+        # Construir teclado inline con botones por cada grupo (máximo 50 para evitar saturar el mensaje)
+        keyboard = []
+        for title, g_id in chats_list[:50]:
+            # Acortamos el título si es muy largo para que el botón luzca limpio
+            clean_title = title[:35] + "..." if len(title) > 35 else title
+            keyboard.append([InlineKeyboardButton(f"📁 {clean_title}", callback_data=f"ub_group_sel:{g_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        for (g_id,) in rows:
-            try:
-                chat_info = await client.get_chat(g_id)
-                nombre_grupo = chat_info.title
-            except Exception:
-                nombre_grupo = "Grupo desconocido / Sin acceso actual"
-                
-            texto_grupos += f"🔹 **Nombre:** {nombre_grupo}\n🆔 **ID:** `{g_id}`\n\n"
-            
-        if len(texto_grupos) > 4000:
-            for i in range(0, len(texto_grupos), 4000):
-                await message.reply(texto_grupos[i:i+4000])
-            await msg_estado.delete()
-        else:
-            await msg_estado.edit_text(texto_grupos)
-                
+        await msg_estado.edit_text(
+            "📋 **Panel de Control - Grupos del UserBot**\n\n"
+            "Selecciona un grupo de la lista para gestionar su escaneo, forzar respaldos o revisar sus temas de foro:",
+            reply_markup=reply_markup
+        )
+
     except Exception as e:
-        await msg_estado.edit_text(f"❌ Error al consultar la base de datos: `{e}`")
-        await send_error_alert(client, "listar_grupos_db", e)
+        await msg_estado.edit_text(f"❌ **Error al escanear los chats del UserBot:**\n`{str(e)}`")
+        await send_error_alert(client, "grupos_userbot_interactive_cmd", e)
+# --- MANEJADOR DE SELECCIÓN DE GRUPO Y DETECCIÓN DE FOROS ---
+@app.on_callback_query(filters.regex(r"^ub_group_sel:"))
+async def userbot_group_selected_callback(client, callback_query):
+    if not is_authorized(callback_query.from_user.id):
+        await callback_query.answer("⚠️ No tienes permisos.", show_alert=True)
+        return
+
+    try:
+        _, group_id_str = callback_query.data.split(":")
+        group_id = int(group_id_str)
+    except ValueError:
+        await callback_query.answer("❌ ID de grupo inválida.", show_alert=True)
+        return
+
+    if not user_bot or not user_bot.is_connected:
+        await callback_query.answer("⚠️ El UserBot no está conectado.", show_alert=True)
+        return
+
+    await callback_query.answer("🔍 Analizando estructura del grupo...")
+
+    try:
+        # Validar chat y verificar si es un foro (tiene temas)
+        chat = await user_bot.get_chat(group_id)
+        group_title = chat.title or "Grupo"
+        
+        # En Pyrogram / Telegram, los grupos con temas activos tienen la propiedad is_forum == True
+        is_forum = getattr(chat, "is_forum", False)
+
+        if is_forum:
+            # Intentamos obtener los temas recientes del foro mediante los mensajes o la API de Telegram
+            # Como los foros manejan hilos, listamos opciones interactivas para el usuario
+            buttons = [
+                [InlineKeyboardButton("⭐ Configurar Tema Prioritario / Selectivo", callback_data=f"ub_forum_menu:{group_id}")],
+                [InlineKeyboardButton("⚡ Forzar Escaneo General del Foro", callback_data=f"ub_scan_start:{group_id}:0")],
+                [InlineKeyboardButton("⬅️ Volver a la Lista", callback_data="ub_back_to_groups")]
+            ]
+            await callback_query.message.edit_text(
+                f"📂 **Grupo con Temas (Foro) Detectado**\n\n"
+                f"• **Nombre:** {group_title}\n"
+                f"• **ID:** `{group_id}`\n"
+                f"• **Modalidad:** 🧵 *Organizado por Temas*\n\n"
+                f"Selecciona una opción de escaneo:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            # Grupo normal sin temas
+            buttons = [
+                [InlineKeyboardButton("🚀 Forzar Escaneo Automático", callback_data=f"ub_scan_start:{group_id}:0")],
+                [InlineKeyboardButton("⬅️ Volver a la Lista", callback_data="ub_back_to_groups")]
+            ]
+            await callback_query.message.edit_text(
+                f"📁 **Grupo Normal (Sin Temas)**\n\n"
+                f"• **Nombre:** {group_title}\n"
+                f"• **ID:** `{group_id}`\n\n"
+                f"¿Deseas iniciar el escaneo de este grupo ahora mismo?",
+                reply_markup=buttons
+            )
+
+    except Exception as e:
+        await callback_query.message.edit_text(f"❌ **Error al inspeccionar el grupo:**\n`{str(e)}`")
+        await send_error_alert(client, "userbot_group_selected_callback", e, chat_id=group_id)
+
+# --- MENÚ DE RETORNO A LA LISTA DE GRUPOS ---
+@app.on_callback_query(filters.regex(r"^ub_back_to_groups$"))
+async def back_to_groups_callback(client, callback_query):
+    if not is_authorized(callback_query.from_user.id):
+        return
+
+    await callback_query.answer()
+    # Reutilizamos la lógica visual simulando el comando /grupos
+    try:
+        chats_list = []
+        async for dialog in user_bot.get_dialogs():
+            chat = dialog.chat
+            if chat.type in ["group", "supergroup"]:
+                chats_list.append((chat.title or "Grupo sin nombre", chat.id))
+
+        keyboard = []
+        for title, g_id in chats_list[:50]:
+            clean_title = title[:35] + "..." if len(title) > 35 else title
+            keyboard.append([InlineKeyboardButton(f"📁 {clean_title}", callback_data=f"ub_group_sel:{g_id}")])
+
+        await callback_query.message.edit_text(
+            "📋 **Panel de Control - Grupos del UserBot**\n\n"
+            "Selecciona un grupo de la lista para gestionar su escaneo:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        await callback_query.message.edit_text(f"❌ Error al recargar la lista: {e}")
+
+# --- MOTOR DE ESCANEO ACTIVO DEL USERBOT CON CHECKPOINTS ---
+@app.on_callback_query(filters.regex(r"^ub_scan_start:"))
+async def userbot_scan_start_callback(client, callback_query):
+    if not is_authorized(callback_query.from_user.id):
+        await callback_query.answer("⚠️ No tienes permisos.", show_alert=True)
+        return
+
+    try:
+        _, group_id_str, thread_id_str = callback_query.data.split(":")
+        target_group_id = int(group_id_str)
+        target_thread_id = int(thread_id_str)
+    except ValueError:
+        await callback_query.answer("❌ Parámetros de escaneo inválidos.", show_alert=True)
+        return
+
+    if not user_bot or not user_bot.is_connected:
+        await user_bot.start()
+
+    await callback_query.answer("🚀 Iniciando motor de escaneo del UserBot...")
+    
+    msg_estado = callback_query.message
+    await msg_estado.edit_text(
+        f"⏳ **Iniciando escaneo con UserBot**\n\n"
+        f"• **Grupo ID:** `{target_group_id}`\n"
+        f"• **Hilo / Tema ID:** `{target_thread_id if target_thread_id != 0 else 'General / Sin Tema'}`\n\n"
+        f"Consultando historial y preparando el flujo..."
+    )
+
+    # Disparamos el proceso en segundo plano para no congelar el bot
+    asyncio.create_task(
+        run_userbot_scanner_background(client, msg_estado, target_group_id, target_thread_id)
+    )
+
+
+async def run_userbot_scanner_background(client, status_message, group_id, thread_id):
+    try:
+        # Verificar si hay un checkpoint guardado previamente para este grupo/hilo
+        if thread_id != 0:
+            cursor.execute("SELECT last_message_id FROM forum_checkpoints WHERE group_id = ? AND thread_id = ?", (group_id, thread_id))
+        else:
+            cursor.execute("SELECT last_message_id FROM scan_checkpoint WHERE group_id = ?", (group_id,))
+        
+        cp_row = cursor.fetchone()
+        offset_id = cp_row[0] if cp_row else 0
+
+        total_revisados = 0
+        total_enviados = 0
+        start_time = time.time()
+
+        while True:
+            try:
+                mensajes = []
+                # Obtenemos el historial usando la sesión del UserBot
+                # Nota: Si el chat es un foro, Pyrogram permite filtrar o iterar por message_thread_id si la API lo soporta,
+                # o filtramos en caliente.
+                async for msg in user_bot.get_chat_history(group_id, limit=100, offset_id=offset_id):
+                    # Si es un foro con tema específico, filtramos por el thread_id correspondiente
+                    if thread_id != 0 and getattr(msg, "message_thread_id", None) != thread_id:
+                        continue
+                    mensajes.append(msg)
+
+                if not mensajes:
+                    break  # Fin del historial
+
+                for msg in mensajes:
+                    total_revisados += 1
+                    # Filtramos exclusivamente videos y fotos según lo acordado
+                    if msg.video or msg.photo:
+                        try:
+                            if DESTINATION_CHAT_ID:
+                                await user_bot.copy_message(DESTINATION_CHAT_ID, group_id, msg.id)
+                                total_enviados += 1
+                        except FloodWait as fw:
+                            raise fw
+                        except Exception:
+                            pass
+
+                # Actualizar checkpoint persistente en SQLite
+                offset_id = mensajes[-1].id
+                if thread_id != 0:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO forum_checkpoints (group_id, thread_id, last_message_id) VALUES (?, ?, ?)",
+                        (group_id, thread_id, offset_id)
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO scan_checkpoint (group_id, last_message_id) VALUES (?, ?)",
+                        (group_id, offset_id)
+                    )
+                conn.commit()
+
+                # Reporte en vivo cada cierto intervalo
+                if total_revisados % 200 == 0:
+                    try:
+                        elapsed = time.time() - start_time
+                        speed = total_revisados / elapsed if elapsed > 0 else 1
+                        await status_message.edit_text(
+                            f"📊 **Escaneo Activo del UserBot en Progreso**\n\n"
+                            f"📁 **Grupo ID:** `{group_id}`\n"
+                            f"💬 Mensajes analizados: **{total_revisados}**\n"
+                            f"📤 Multimedia respaldada: **{total_enviados}**\n"
+                            f"📍 Checkpoint ID: `{offset_id}`\n"
+                            f"⚡ Velocidad: `{speed:.1f} msg/s`"
+                        )
+                    except Exception:
+                        pass
+
+            except FloodWait as e:
+                # Freno de emergencia ante restricciones de Telegram
+                wait_time = e.value
+                try:
+                    await status_message.edit_text(
+                        f"🚨 **Freno de Emergencia (FloodWait - UserBot)**\n\n"
+                        f"Telegram ha pausado temporalmente la cuenta.\n⏳ Reanudando automáticamente en `{wait_time}` segundos..."
+                    )
+                except Exception:
+                    pass
+                
+                await asyncio.sleep(wait_time + 2)
+                continue
+
+        # Mensaje final al completar con éxito
+        await status_message.edit_text(
+            f"✅ **Escaneo del UserBot Finalizado con Éxito**\n\n"
+            f"📁 **Grupo ID:** `{group_id}`\n"
+            f"💬 Total analizados: **{total_revisados}**\n"
+            f"📤 Multimedia enviada al Almacén: **{total_enviados}**"
+        )
+
+    except Exception as e:
+        try:
+            await status_message.edit_text(f"❌ **Error crítico durante el escaneo del UserBot:**\n`{str(e)}`")
+        except Exception:
+            pass
+        await send_error_alert(client, "run_userbot_scanner_background", e, chat_id=group_id)
 
 # --- FUNCIÓN TEMPORAL DE EMERGENCIA PARA SALIR POR ENLACE PÚBLICO ---
 @app.on_message(filters.command("salirenlace") & filters.private)
@@ -1582,8 +1819,16 @@ async def bot_status_cmd(client, message):
     cursor.execute("SELECT COUNT(*) FROM videos")
     total_vids = cursor.fetchone()[0]
 
+    # Consultar el modo actual en la base de datos
+    cursor.execute("SELECT value FROM system_config WHERE key = 'operation_mode'")
+    mode_row = cursor.fetchone()
+    current_mode = mode_row[0] if mode_row else "bot"
+    
+    mode_str = "👤 UserBot Activo" if current_mode == "userbot" else "🤖 Bot Normal"
+
     status_text = (
-        "🤖 **Diagnóstico de Estado del Bot**\n\n"
+        "🤖 **Diagnóstico de Estado del Sistema**\n\n"
+        f"• Modo de Operación: `{mode_str}`\n"
         f"• RAM Disponible: `{ram.available / (1024**2):.1f} MB` (`{100 - ram.percent:.1f}%`)\n"
         f"• Total Registros de Video: `{total_vids}`\n"
         f"• Lotes Pendientes en Cola: `{batch_queue.qsize()}`\n"
@@ -1591,8 +1836,60 @@ async def bot_status_cmd(client, message):
         f"• Canal Destino: `{DESTINATION_CHAT_ID}`\n"
         f"• SQLite WAL: `Activo`"
     )
-    msg = await safe_reply_message(message, status_text)
-    asyncio.create_task(delete_message_later(msg, delay=10))
+
+    # Botones para alternar el modo
+    next_mode_target = "bot" if current_mode == "userbot" else "userbot"
+    next_mode_label = "🤖 Cambiar a Bot Normal" if current_mode == "userbot" else "👤 Cambiar a UserBot"
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton(next_mode_label, callback_data=f"ask_switch_mode:{next_mode_target}")]
+    ])
+
+    msg = await safe_reply_message(message, status_text, reply_markup=buttons)
+    asyncio.create_task(delete_message_later(msg, delay=15))
+
+@app.on_callback_query(filters.regex(r"^(ask_switch_mode|confirm_switch_mode|cancel_switch_mode):"))
+async def handle_mode_switch_callbacks(client, callback_query):
+    if not is_authorized(callback_query.from_user.id):
+        await callback_query.answer("⚠️ No tienes permisos para cambiar el modo.", show_alert=True)
+        return
+
+    data_parts = callback_query.data.split(":")
+    action = data_parts[0]
+    target_mode = data_parts[1]
+
+    if action == "ask_switch_mode":
+        mode_display = "👤 UserBot" if target_mode == "userbot" else "🤖 Bot Normal"
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirmar", callback_data=f"confirm_switch_mode:{target_mode}"),
+                InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_switch_mode:{target_mode}")
+            ]
+        ])
+        await callback_query.message.edit_text(
+            f"⚠️ **¿Estás seguro de cambiar el sistema al modo `{mode_display}`?**\n\nEsta acción modificará la forma en que el bot gestiona las tareas pesadas.",
+            reply_markup=buttons
+        )
+        await callback_query.answer()
+
+    elif action == "cancel_switch_mode":
+        await callback_query.answer("Acción cancelada.")
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+
+    elif action == "confirm_switch_mode":
+        # Guardar de manera persistente en la base de datos
+        cursor.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('operation_mode', ?)", (target_mode,))
+        conn.commit()
+
+        mode_display = "👤 UserBot" if target_mode == "userbot" else "🤖 Bot Normal"
+        await callback_query.answer(f"¡Modo cambiado exitosamente a {mode_display}!", show_alert=True)
+        
+        await callback_query.message.edit_text(
+            f"✅ **¡Modo Actualizado con Éxito!**\n\nEl sistema ahora opera en: ` {mode_display} `\nEste estado persistirá incluso si el contenedor de Railway se reinicia."
+        )
 
 @app.on_message(filters.command("reiniciar"))
 async def restart_cmd(client, message):
