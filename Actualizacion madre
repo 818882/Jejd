@@ -1,0 +1,1639 @@
+import os
+import sys
+import gc
+import sqlite3
+import subprocess
+import asyncio
+import time
+import shutil
+import hashlib
+import traceback
+from datetime import datetime
+import psutil
+import imagehash
+from PIL import Image, ImageStat
+import imageio_ffmpeg
+from pyrogram import Client, filters, idle
+from pyrogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaVideo, ChatMemberUpdated
+from pyrogram.errors import FloodWait, RPCError, UserIsBlocked, PeerIdInvalid, UserNotParticipant
+from aiohttp import web
+import logging
+
+# --- CONFIGURACIÓN BÁSICA DE LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DESTINATION_CHAT_ID = int(os.environ.get("DESTINATION_CHAT_ID", 0))
+
+# --- CONFIGURACIÓN DE USERBOT HÍBRIDO ---
+USER_SESSION_STRING = os.environ.get("USER_SESSION_STRING", "")
+user_bot = None
+if USER_SESSION_STRING and API_ID and API_HASH:
+    user_bot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION_STRING)
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "SuperClaveSegura2026")
+
+raw_admins = os.environ.get("ALLOWED_ADMINS", "")
+ALLOWED_ADMINS = [int(i.strip()) for i in raw_admins.split(",") if i.strip().isdigit()]
+
+MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
+
+# --- RUTA ABSOLUTA DE BASE DE DATOS Y CARPETAS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "bot_data.db")
+DB_BAK_PATH = os.path.join(DATA_DIR, "bot_data.db.bak")
+
+# Hash global para evitar duplicar respaldos de la DB
+LAST_BACKUP_HASH = None
+
+def get_db_hash(db_path):
+    """Calcula el hash MD5 del archivo DB para verificar si cambió."""
+    if not os.path.exists(db_path):
+        return None
+    hasher = hashlib.md5()
+    with open(db_path, "rb") as f:
+        buf = f.read()
+        hasher.update(buf)
+    return hasher.hexdigest()
+
+def create_db_backup():
+    """Crea una copia rápida (.bak) de la base de datos."""
+    try:
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, DB_BAK_PATH)
+    except Exception as e:
+        print(f"Error creando backup de BD: {e}")
+
+def restore_db_backup():
+    """Restaura la BD desde la copia de respaldo si falla la principal."""
+    try:
+        if os.path.exists(DB_BAK_PATH):
+            shutil.copy2(DB_BAK_PATH, DB_PATH)
+            return True
+    except Exception as e:
+        print(f"Error restaurando backup de BD: {e}")
+    return False
+
+# --- INICIALIZACIÓN DE BOT Y BASE DE DATOS (MODO WAL) ---
+app = Client("video_checker_bot_v2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+try:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+except sqlite3.DatabaseError:
+    print("⚠️ Base de datos corrupta o inaccesible. Restaurando desde backup...")
+    if restore_db_backup():
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+    else:
+        raise
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phash TEXT,
+    group_id INTEGER,
+    file_unique_id TEXT,
+    file_size INTEGER,
+    duration INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_stats (
+    user_id INTEGER,
+    group_id INTEGER,
+    video_count INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, group_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS allowed_admins (
+    user_id INTEGER PRIMARY KEY
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS pending_deletions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER,
+    message_id INTEGER,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chat_id, message_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS scan_checkpoint (
+    group_id INTEGER PRIMARY KEY,
+    last_message_id INTEGER
+)
+""")
+
+# --- TABLAS NUEVAS PARA FOROS, HILOS Y ESTADO DEL SISTEMA HÍBRIDO ---
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS forum_checkpoints (
+    group_id INTEGER,
+    thread_id INTEGER,
+    last_message_id INTEGER,
+    PRIMARY KEY (group_id, thread_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS system_config (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS scanned_chats (
+    group_id INTEGER PRIMARY KEY,
+    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS mensajes_historial (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    chat_id INTEGER, 
+    mensaje_id INTEGER, 
+    texto TEXT
+)
+""")
+conn.commit()
+
+# Restaurar configuración de modo de operación (Bot Normal o UserBot) y Destination ID
+cursor.execute("SELECT value FROM system_config WHERE key = 'DESTINATION_CHAT_ID'")
+config_dest = cursor.fetchone()
+if config_dest:
+    DESTINATION_CHAT_ID = int(config_dest[0])
+elif DESTINATION_CHAT_ID != 0:
+    cursor.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('DESTINATION_CHAT_ID', ?)", (str(DESTINATION_CHAT_ID),))
+    conn.commit()
+
+# Cargar modo de operación activo ("bot" o "userbot") desde BD (Por defecto "bot")
+cursor.execute("SELECT value FROM system_config WHERE key = 'operation_mode'")
+mode_row = cursor.fetchone()
+CURRENT_OPERATION_MODE = mode_row[0] if mode_row else "bot"
+
+cursor.execute("SELECT user_id FROM allowed_admins")
+db_admins = cursor.fetchall()
+for (adm_id,) in db_admins:
+    if adm_id not in ALLOWED_ADMINS:
+        ALLOWED_ADMINS.append(adm_id)
+
+# --- COLA DE PROCESAMIENTO Y CONTROL DE CONCURRENCIA ---
+processing_semaphore = asyncio.Semaphore(1)
+batch_queue = asyncio.Queue()
+
+user_buffers = {}
+buffer_locks = asyncio.Lock()
+active_scans = set()
+
+backup_channel_msg_id = None
+backup_channel_total_count = 0
+backup_counter_lock = asyncio.Lock()
+
+CURRENT_BACKOFF = 1.2
+MIN_BACKOFF = 0.5
+MAX_BACKOFF = 3.0
+# --- RESPALDO CON HASH Y AUTO-RECUPERACIÓN DE BD ---
+async def backup_db_if_changed(client, reason="Respaldo Automático"):
+    global LAST_BACKUP_HASH
+    if not MASTER_ADMIN_ID or not os.path.exists(DB_PATH):
+        return
+
+    current_hash = get_db_hash(DB_PATH)
+    if current_hash == LAST_BACKUP_HASH:
+        return
+
+    try:
+        create_db_backup()
+        date_info = get_db_date_range()
+        cap = f"🗄️ **Respaldo Automático de Base de Datos**\n\n📌 Motivo: `{reason}`\n🔑 Hash: `{current_hash[:8]}`\n{date_info}"
+        await client.send_document(chat_id=MASTER_ADMIN_ID, document=DB_PATH, caption=cap)
+        LAST_BACKUP_HASH = current_hash
+    except Exception as e:
+        print(f"Error al enviar el respaldo automático: {e}")
+
+async def auto_restore_db_on_startup(client):
+    """Busca y restaura la última base de datos del Admin Maestro si la local no existe."""
+    if not MASTER_ADMIN_ID:
+        return
+
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        print(f"✅ Base de datos cargada correctamente desde: {DB_PATH}")
+        return
+
+    print("⚠️ No se encontró la base de datos local. Buscando último respaldo en el chat del Admin Maestro...")
+    try:
+        async for msg in client.get_chat_history(MASTER_ADMIN_ID, limit=20):
+            if msg.document and msg.document.file_name.endswith(".db"):
+                print("📥 Descargando la última base de datos guardada...")
+                await client.download_media(msg, file_name=DB_PATH)
+                print("✅ Base de datos autorestaurada con éxito desde el chat privado.")
+                return
+    except Exception as e:
+        print(f"❌ Error en la autorestauración al iniciar: {e}")
+
+# --- SISTEMA DE ALERTAS Y ERRORES ---
+async def send_error_alert(client, context, error, chat_id=None):
+    if not MASTER_ADMIN_ID:
+        return
+    tb = traceback.format_exc()
+    error_msg = (
+        f"🚨 **ALERTA DE ERROR CRÍTICO**\n\n"
+        f"📌 **Origen:** `{context}`\n"
+        f"📁 **Chat ID afectado:** `{chat_id if chat_id else 'No especificado'}`\n"
+        f"🔴 **Detalle:** `{str(error)}`\n\n"
+        f"📄 **Traceback:**\n```python\n{tb[-1000:]}\n```"
+    )
+    try:
+        await client.send_message(chat_id=MASTER_ADMIN_ID, text=error_msg)
+        await backup_db_if_changed(client, reason=f"🚨 Respaldo por Error: {context}")
+    except Exception as e:
+        print(f"Error al enviar la alerta al Admin Maestro: {e}")
+
+# --- SERVIDOR WEB DUMMY ---
+async def handle_ping(request):
+    return web.Response(text="Bot Online")
+
+async def start_web_server():
+    server_app = web.Application()
+    server_app.add_routes([web.get('/', handle_ping)])
+    runner = web.AppRunner(server_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# --- FUNCIONES AUXILIARES Y DE VERIFICACIÓN DE PERMISOS ---
+def is_authorized(user_id):
+    return user_id in ALLOWED_ADMINS or user_id == MASTER_ADMIN_ID
+
+def is_master_admin(user_id):
+    return user_id == MASTER_ADMIN_ID and MASTER_ADMIN_ID != 0
+
+# Caché temporal de administradores para evitar bloqueos de la API
+admin_status_cache = {}
+async def is_bot_admin_in_chat(client, chat_id):
+    """Verifica si el bot tiene permisos de administración con caché para evitar FloodWait."""
+    if chat_id in admin_status_cache:
+        return admin_status_cache[chat_id]
+    try:
+        member = await client.get_chat_member(chat_id, "me")
+        is_adm = member.status in ["administrator", "creator"]
+        admin_status_cache[chat_id] = is_adm
+        return is_adm
+    except Exception:
+        return False
+
+def get_user_badge(count):
+    if count >= 350: return "🏆 Leyenda Máxima"
+    elif count >= 250: return "🥇 Aportador Platino"
+    elif count >= 150: return "🥈 Aportador Oro"
+    elif count >= 50: return "🥉 Aportador Plata"
+    else: return "🌱 Novato"
+
+def get_ram_limits():
+    ram_percent = psutil.virtual_memory().available / psutil.virtual_memory().total * 100
+    if ram_percent > 70:
+        return 9, 314572800
+    elif ram_percent >= 30:
+        return 5, 104857600
+    else:
+        return 2, 52428800
+
+async def adjust_backoff(api_latency):
+    global CURRENT_BACKOFF
+    if api_latency < 0.3:
+        CURRENT_BACKOFF = max(MIN_BACKOFF, CURRENT_BACKOFF - 0.1)
+    elif api_latency > 1.5:
+        CURRENT_BACKOFF = min(MAX_BACKOFF, CURRENT_BACKOFF + 0.3)
+
+async def delete_message_later(message, delay=10):
+    if not message or message.chat.type not in ["group", "supergroup"]:
+        return
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+async def custom_download_media(client, file_id, file_name, chat_id=None):
+    try:
+        ruta = os.path.join(DOWNLOADS_DIR, file_name)
+        return await client.download_media(file_id, file_name=ruta)
+    except Exception as e:
+        print(f"Error descargando miniatura {file_name}: {e}")
+        return None
+
+async def safe_copy_message(client, message, chat_id, retries=3):
+    if not chat_id:
+        return None
+    global CURRENT_BACKOFF
+    for attempt in range(retries):
+        try:
+            start_t = time.time()
+            copied = await message.copy(chat_id=chat_id)
+            latency = time.time() - start_t
+            await adjust_backoff(latency)
+            return copied
+        except FloodWait as e:
+            CURRENT_BACKOFF = min(MAX_BACKOFF, CURRENT_BACKOFF + 1.0)
+            await asyncio.sleep(e.value + 1)
+        except (PeerIdInvalid, ValueError) as e:
+            print(f"⚠️ ID inválido o incompatible en safe_copy_message: {e}")
+            return None
+        except Exception as e:
+            await asyncio.sleep(CURRENT_BACKOFF)
+            if attempt == retries - 1:
+                await send_error_alert(client, "safe_copy_message", e)
+    return None
+
+async def safe_reply_message(message, text, reply_markup=None):
+    try:
+        return await message.reply_text(text, reply_markup=reply_markup)
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 1)
+        try:
+            return await message.reply_text(text, reply_markup=reply_markup)
+        except Exception:
+            return None
+    except Exception:
+        return None
+# --- COLA DE BORRADO PERSISTENTE CONTROLADA ---
+def add_to_deletion_queue(chat_id, message_id):
+    cursor.execute("INSERT OR IGNORE INTO pending_deletions (chat_id, message_id) VALUES (?, ?)", (chat_id, message_id))
+    conn.commit()
+
+async def worker_process_deletion_queue(client):
+    global CURRENT_BACKOFF
+    while True:
+        try:
+            try:
+                cursor.execute("SELECT id, chat_id, message_id FROM pending_deletions ORDER BY id ASC LIMIT 10")
+                rows = cursor.fetchall()
+            except sqlite3.ProgrammingError:
+                await asyncio.sleep(5)
+                continue
+
+            if not rows:
+                await asyncio.sleep(5)
+                continue
+
+            for row_id, chat_id, msg_id in rows:
+                try:
+                    start_t = time.time()
+                    await client.delete_messages(chat_id=chat_id, message_ids=msg_id)
+                    await adjust_backoff(time.time() - start_t)
+                    
+                    cursor.execute("DELETE FROM pending_deletions WHERE id = ?", (row_id,))
+                    conn.commit()
+                    await asyncio.sleep(max(1.0, CURRENT_BACKOFF))
+                except FloodWait as e:
+                    CURRENT_BACKOFF = min(MAX_BACKOFF, CURRENT_BACKOFF + 1.0)
+                    await asyncio.sleep(e.value + 2)
+                except RPCError:
+                    cursor.execute("DELETE FROM pending_deletions WHERE id = ?", (row_id,))
+                    conn.commit()
+                except Exception:
+                    await asyncio.sleep(2)
+        except sqlite3.ProgrammingError:
+            await asyncio.sleep(5)
+        except Exception as e:
+            await send_error_alert(client, "worker_process_deletion_queue", e)
+            await asyncio.sleep(5)
+
+# --- VERIFICACIÓN MULTIPUNTO EN 3 NIVELES ---
+def is_low_entropy_image(image_path):
+    try:
+        with Image.open(image_path) as img:
+            stat = ImageStat.Stat(img.convert('L'))
+            if stat.stddev[0] < 8.0:
+                return True
+    except Exception:
+        pass
+    return False
+
+def extract_phash_from_frame(video_path):
+    thumb_path = f"{video_path}_sec3.jpg"
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [ffmpeg_exe, "-y", "-ss", "00:00:03", "-i", video_path, "-vframes", "1", "-threads", "1", "-s", "320x240", thumb_path]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Error ejecutando ffmpeg: {e}")
+        return None
+    
+    hash_val = None
+    if os.path.exists(thumb_path):
+        if not is_low_entropy_image(thumb_path):
+            with Image.open(thumb_path) as img:
+                hash_val = str(imagehash.phash(img))
+        os.remove(thumb_path)
+    return hash_val
+
+def check_multipoint_duplicate(group_id, file_unique_id, file_size, duration, v_hash):
+    cursor.execute("SELECT id FROM videos WHERE file_unique_id = ?", (file_unique_id,))
+    if cursor.fetchone():
+        return True, "Nivel 1 (ID Único Global)"
+
+    if v_hash:
+        cursor.execute("SELECT phash, file_size, duration FROM videos WHERE phash IS NOT NULL")
+        rows = cursor.fetchall()
+        for stored_hash, stored_size, stored_dur in rows:
+            size_match = stored_size and file_size and abs(stored_size - file_size) < 1024
+            dur_match = stored_dur and duration and abs(stored_dur - duration) <= 1
+            
+            if stored_hash:
+                diff = imagehash.hex_to_hash(v_hash) - imagehash.hex_to_hash(stored_hash)
+                if diff <= 2 and (size_match or dur_match):
+                    return True, "Nivel 3 (pHash + Metadatos)"
+    return False, None
+
+# --- NOTIFICADOR DINÁMICO EN CANAL DE RESPALDO EN TIEMPO REAL ---
+async def update_backup_channel_counter(client, added_count, group_title=""):
+    global backup_channel_msg_id, backup_channel_total_count
+    if not DESTINATION_CHAT_ID:
+        return
+
+    async with backup_counter_lock:
+        backup_channel_total_count += added_count
+        now_str = datetime.now().strftime("%H:%M:%S")
+        
+        in_queue = batch_queue.qsize()
+        text = (
+            f"📊 **Respaldo en Vivo de Videos**\n\n"
+            f"📁 **Origen:** `{group_title if group_title else 'Modo Silencioso'}`\n"
+            f"📥 **Videos Procesados:** `{backup_channel_total_count}`\n"
+            f"📦 **Lotes en Cola:** `{in_queue}`\n"
+            f"⏳ **Videos Pendientes en Fila:** `{in_queue * 5}` aprox.\n"
+            f"⏱️ **Última actualización:** `{now_str}`"
+        )
+        
+        try:
+            if backup_channel_msg_id is None:
+                sent = await client.send_message(DESTINATION_CHAT_ID, text)
+                backup_channel_msg_id = sent.id
+            else:
+                await client.edit_message_text(DESTINATION_CHAT_ID, backup_channel_msg_id, text)
+        except Exception:
+            try:
+                sent = await client.send_message(DESTINATION_CHAT_ID, text)
+                backup_channel_msg_id = sent.id
+            except Exception as e:
+                await send_error_alert(client, "update_backup_channel_counter", e)
+# --- NUEVA FUNCIÓN CORREGIDA: LISTAR GRUPOS DESDE LA BASE DE DATOS ---
+@app.on_message(filters.command("grupos") & filters.private)
+async def listar_grupos_activos(client, message):
+    if not is_authorized(message.from_user.id): return
+    
+    msg_estado = await message.reply("⏳ Consultando registros de grupos en la base de datos...")
+    
+    try:
+        cursor.execute("SELECT DISTINCT group_id FROM scan_checkpoint UNION SELECT DISTINCT group_id FROM scanned_chats")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            await msg_estado.edit_text("ℹ️ El bot aún no tiene registros de grupos activos en la base de datos.\n*(Un grupo se registra automáticamente al ejecutar un escaneo o cuando el bot se une).*")
+            return
+            
+        texto_grupos = "📋 **Grupos registrados en la Base de Datos:**\n\n"
+        
+        for (g_id,) in rows:
+            try:
+                chat_info = await client.get_chat(g_id)
+                nombre_grupo = chat_info.title
+            except Exception:
+                nombre_grupo = "Grupo desconocido / Sin acceso actual"
+                
+            texto_grupos += f"🔹 **Nombre:** {nombre_grupo}\n🆔 **ID:** `{g_id}`\n\n"
+            
+        if len(texto_grupos) > 4000:
+            for i in range(0, len(texto_grupos), 4000):
+                await message.reply(texto_grupos[i:i+4000])
+            await msg_estado.delete()
+        else:
+            await msg_estado.edit_text(texto_grupos)
+                
+    except Exception as e:
+        await msg_estado.edit_text(f"❌ Error al consultar la base de datos: `{e}`")
+        await send_error_alert(client, "listar_grupos_db", e)
+
+# --- FUNCIÓN TEMPORAL DE EMERGENCIA PARA SALIR POR ENLACE PÚBLICO ---
+@app.on_message(filters.command("salirenlace") & filters.private)
+async def salir_por_enlace_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ **Formato:** `/salirenlace t.me/tu_grupo o @tu_grupo`")
+        return
+        
+    enlace = args[1]
+    
+    try:
+        chat = await client.get_chat(enlace)
+        chat_id = chat.id
+        titulo = chat.title
+        
+        await client.leave_chat(chat_id)
+        await message.reply(f"✅ **¡Éxito!** El bot ha abandonado el grupo **{titulo}** (ID: `{chat_id}`).")
+        
+    except Exception as e:
+        await message.reply(f"❌ **No se pudo procesar el enlace:**\n`{str(e)}`")
+
+# --- FUNCIÓN TEMPORAL DE CAZA DE IDS ---
+@app.on_message(filters.command("cazarids") & filters.private)
+async def cazar_ids_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    
+    msg_estado = await message.reply("🕵️‍♂️ Iniciando barrido de rastreo en chats conocidos...")
+    
+    cursor.execute("SELECT DISTINCT group_id FROM scan_checkpoint UNION SELECT DISTINCT group_id FROM scanned_chats")
+    rows = cursor.fetchall()
+    
+    if not rows:
+        await msg_estado.edit_text("ℹ️ No hay registros de grupos en la base de datos para barrer.")
+        return
+        
+    enviados = 0
+    errores = 0
+    
+    for (g_id,) in rows:
+        try:
+            await client.send_message(g_id, "🤖 *[Sincronización de sistema]*")
+            enviados += 1
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            errores += 1
+            await send_error_alert(client, "cazar_ids_fallido", e, chat_id=g_id)
+            
+    await msg_estado.edit_text(f"✅ **Barrido finalizado:**\n• Intentos exitosos: `{enviados}`\n• Errores atrapados: `{errores}`\n\nRevisa tus alertas privadas para ver las IDs de los chats con error.")
+
+# --- NUEVA FUNCIÓN: ABANDONO DE GRUPO A CONTROL REMOTO ---
+@app.on_message(filters.command("salir") & filters.private)
+async def salir_grupo_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ **Formato:** `/salir <ID_DEL_GRUPO>`")
+        return
+        
+    try:
+        target_chat_id = int(args[1])
+    except ValueError:
+        await message.reply("🔴 **Error:** La ID debe ser numérica.")
+        return
+        
+    try:
+        await client.leave_chat(target_chat_id)
+        await message.reply(f"✅ **Éxito:** El bot ha abandonado el grupo `{target_chat_id}` de forma silenciosa.")
+    except Exception as e:
+        await message.reply(f"❌ **Error al intentar salir del grupo:**\n`{str(e)}`")
+
+# --- COMANDO DE EMERGENCIA PARA FORZAR CACHÉ DE CHAT ---
+@app.on_message(filters.command("forzarcache") & filters.private)
+async def forzar_cache_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ Usa: `/forzarcache -1002483678785`")
+        return
+    try:
+        chat_id = int(args[1])
+        chat = await client.get_chat(chat_id)
+        await message.reply(f"✅ ¡Caché creada con éxito!\n📁 Nombre: **{chat.title}**\n🆔 ID: `{chat.id}`\n\nAhora ya puedes usar `/salir {chat.id}` sin errores.")
+    except Exception as e:
+        await message.reply(f"❌ Error al cachear: `{str(e)}`")
+
+# --- NUEVA FUNCIÓN: ESCANEO REMOTO DE MULTIMEDIA CON FRENO DE EMERGENCIA ---
+@app.on_message(filters.command("scanremoto") & filters.private)
+async def scan_remoto_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    
+    if not DESTINATION_CHAT_ID:
+        await message.reply("⚠️ **Error:** No hay un Canal Destino configurado para reenviar la multimedia. Usa `/setdestination` primero.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("⚠️ **Formato:** `/scanremoto <ID_DEL_GRUPO>`")
+        return
+        
+    try:
+        target_chat_id = int(args[1])
+    except ValueError:
+        await message.reply("🔴 **Error:** La ID debe ser numérica.")
+        return
+
+    msg_estado = await message.reply(f"⏳ **Iniciando escaneo remoto** en el grupo `{target_chat_id}`...\nVerificando historial y buscando multimedia...")
+
+    try:
+        cursor.execute("SELECT last_message_id FROM scan_checkpoint WHERE group_id = ?", (target_chat_id,))
+        cp_row = cursor.fetchone()
+        offset_id = cp_row[0] if cp_row else 0
+        
+        total_revisados = 0
+        total_enviados = 0
+        
+        while True:
+            try:
+                mensajes = []
+                async for msg in client.get_chat_history(target_chat_id, limit=100, offset_id=offset_id):
+                    mensajes.append(msg)
+                    
+                if not mensajes:
+                    break
+                    
+                for msg in mensajes:
+                    total_revisados += 1
+                    if msg.video or msg.photo:
+                        try:
+                            await client.copy_message(DESTINATION_CHAT_ID, target_chat_id, msg.id)
+                            total_enviados += 1
+                        except FloodWait as fw:
+                            raise fw
+                        except Exception:
+                            pass
+                                
+                offset_id = mensajes[-1].id
+                cursor.execute("INSERT OR REPLACE INTO scan_checkpoint (group_id, last_message_id) VALUES (?, ?)", (target_chat_id, offset_id))
+                conn.commit()
+                
+                if total_revisados % 500 == 0:
+                    try:
+                        await msg_estado.edit_text(
+                            f"📊 **Escaneo Remoto en Progreso**\n\n"
+                            f"📁 **Grupo:** `{target_chat_id}`\n"
+                            f"💬 Mensajes revisados: **{total_revisados}**\n"
+                            f"📤 Multimedia al Almacén: **{total_enviados}**\n"
+                            f"📍 Offset Guardado: `{offset_id}`"
+                        )
+                    except Exception: pass
+                        
+            except FloodWait as e:
+                texto_base = f"🚨 **Freno de Emergencia Activado**\n\nTelegram limitó las peticiones.\n⏳ Pausa requerida: `{e.value}` segundos."
+                try:
+                    await msg_estado.edit_text(texto_base)
+                    for remaining in range(e.value, 0, -5):
+                        await asyncio.sleep(min(5, remaining))
+                        try:
+                            await msg_estado.edit_text(f"{texto_base}\n\n🔄 **Reanudando escaneo en:** `{max(0, remaining - 5)}` segundos...")
+                        except Exception: pass
+                except Exception:
+                    await asyncio.sleep(e.value)
+                    
+                continue
+                
+        await msg_estado.edit_text(
+            f"✅ **Escaneo Remoto Finalizado**\n\n"
+            f"📁 **Grupo ID:** `{target_chat_id}`\n"
+            f"💬 Total revisados: **{total_revisados}**\n"
+            f"📤 Multimedia enviada al Almacén: **{total_enviados}**"
+        )
+        
+    except Exception as e:
+        await msg_estado.edit_text(f"❌ **Error en el escaneo remoto:**\n`{str(e)}`")
+        await send_error_alert(client, "scanremoto", e)
+# --- COMANDOS DE MENÚ Y DE BOT ---
+async def set_menu_commands(client):
+    try:
+        await client.set_bot_commands([
+            BotCommand("mystatus", "Comprobar permisos de Admin"),
+            BotCommand("login", "Iniciar sesión como Admin Maestro"),
+            BotCommand("ayuda", "Menú de ayuda"),
+            BotCommand("join", "Añadir el bot a un grupo (Seguro)"),
+            BotCommand("stats", "Estadísticas de envíos del grupo"),
+            BotCommand("scan", "Escanear historial en el grupo"),
+            BotCommand("scan_full", "Re-escanear todo (ignora checkpoints)"),
+            BotCommand("scanremoto", "Escaneo de multimedia a control remoto"),
+            BotCommand("salir", "Abandonar un grupo a control remoto"),
+            BotCommand("grupos", "Lista de grupos activos con su ID"),
+            BotCommand("backup", "Descargar respaldo BD con rango de fechas"),
+            BotCommand("restore", "Restaurar BD enviando archivo .db"),
+            BotCommand("cleanram", "Limpieza y diagnóstico de RAM"),
+            BotCommand("relink", "Re-vincular canal destino"),
+            BotCommand("addadmin", "Autorizar nuevo ID (Solo Admins)"),
+            BotCommand("removeadmin", "Quitar permisos (Solo Admin Maestro)"),
+            BotCommand("checkbackup", "Verificar grupo de respaldo"),
+            BotCommand("adminlist", "Lista de autorizados (MD)"),
+            BotCommand("botstatus", "Diagnóstico del sistema"),
+            BotCommand("id", "Obtener IDs (MD)"),
+            BotCommand("setdestination", "Cambiar canal destino"),
+            BotCommand("reiniciar", "Reiniciar el bot")
+        ])
+    except Exception as e:
+        await send_error_alert(client, "set_menu_commands", e)
+
+# --- AUTO-ESCANEO SILENCIOSO AL UNIRSE A UN NUEVO GRUPO ---
+@app.on_chat_member_updated()
+async def auto_scan_on_join_event(client: Client, chat_member: ChatMemberUpdated):
+    try:
+        bot_user = await client.get_me()
+        if chat_member.new_chat_member and chat_member.new_chat_member.user.id == bot_user.id:
+            chat_id = chat_member.chat.id
+            
+            cursor.execute("SELECT group_id FROM scanned_chats WHERE group_id = ?", (chat_id,))
+            if cursor.fetchone():
+                return
+                
+            is_admin = chat_member.new_chat_member.status in ["administrator", "creator"]
+            asyncio.create_task(run_background_history_scan(client, chat_id, is_admin))
+    except Exception as e:
+        await send_error_alert(client, "auto_scan_on_join_event", e)
+
+async def run_background_history_scan(client: Client, chat_id: int, is_admin: bool):
+    """Procesamiento en segundo plano para no bloquear nuevos envíos en vivo."""
+    if chat_id in active_scans:
+        return
+    active_scans.add(chat_id)
+
+    start_time = time.time()
+    processed_count = 0
+    in_queue_count = 0
+    first_msg_id = None
+    last_msg_id = None
+
+    status_msg = None
+    if DESTINATION_CHAT_ID:
+        try:
+            status_msg = await client.send_message(
+                chat_id=DESTINATION_CHAT_ID,
+                text=f"🔍 **Iniciando Auto-Escaneo de Historial**\n📁 Grupo: `{chat_id}`\n🛡️ Modo: {'ADMINISTRADOR' if is_admin else 'SILENCIOSO (Sin mensajes en origen)'}"
+            )
+        except Exception:
+            pass
+
+    try:
+        total_messages = 0
+        try:
+            total_messages = await client.get_chat_history_count(chat_id)
+        except Exception:
+            total_messages = 5000
+
+        async for message in client.get_chat_history(chat_id):
+            if not first_msg_id: first_msg_id = message.id
+            last_msg_id = message.id
+
+            if message.video:
+                in_queue_count += 1
+                
+                status, data = await process_single_video_data(client, message, is_admin)
+                if status == "valid":
+                    v_hash, g_id, v_uniq, v_sz, v_dur, u_id = data
+                    cursor.execute("INSERT OR IGNORE INTO videos (phash, group_id, file_unique_id, file_size, duration) VALUES (?, ?, ?, ?, ?)",
+                                   (v_hash, g_id, v_uniq, v_sz, v_dur))
+                    conn.commit()
+                    await safe_copy_message(client, message, DESTINATION_CHAT_ID)
+
+                processed_count += 1
+                in_queue_count -= 1
+
+                if processed_count % 10 == 0 and status_msg:
+                    elapsed_time = time.time() - start_time
+                    speed = processed_count / elapsed_time if elapsed_time > 0 else 1
+                    remaining_msgs = max(0, total_messages - processed_count)
+                    eta_seconds = int(remaining_msgs / speed) if speed > 0 else 0
+                    eta_str = f"{eta_seconds // 60}m {eta_seconds % 60}s"
+
+                    try:
+                        await status_msg.edit_text(
+                            f"📊 **Auto-Escaneo en Vivo (Almacén)**\n\n"
+                            f"📁 **Grupo ID:** `{chat_id}`\n"
+                            f"🛡️ **Modo:** {'Admin' if is_admin else 'Silencioso'}\n"
+                            f"📥 **Videos Guardados:** `{processed_count}`\n"
+                            f"📦 **En Cola local:** `{in_queue_count}`\n"
+                            f"📌 **Rango IDs:** `{last_msg_id}` ➔ `{first_msg_id}`\n"
+                            f"⏱️ **Tiempo Estimado (ETA):** `{eta_str}`"
+                        )
+                    except Exception:
+                        pass
+
+        cursor.execute("INSERT OR REPLACE INTO scanned_chats (group_id) VALUES (?)", (chat_id,))
+        conn.commit()
+
+        if status_msg:
+            await status_msg.edit_text(
+                f"✅ **Auto-Escaneo de Historial Finalizado**\n"
+                f"📁 Grupo ID: `{chat_id}`\n"
+                f"🎥 Total Videos Respaldados: `{processed_count}`"
+            )
+
+        await backup_db_if_changed(client, reason=f"Auto-Scan completado para grupo {chat_id}")
+        
+    except Exception as e:
+        await send_error_alert(client, "run_background_history_scan", e, chat_id=chat_id)
+       
+    finally:
+        active_scans.discard(chat_id)
+
+# --- HANDLERS BÁSICOS ---
+@app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    user_id = message.from_user.id
+    if is_master_admin(user_id):
+        text = "👑 **¡Hola, Admin Maestro!**\nTienes acceso total sobre la gestión de permisos y respaldos."
+    elif is_authorized(user_id):
+        text = "👋 **¡Hola! Estás autenticado como Administrador.**\n\nUsa `/ayuda` para ver tus comandos disponibles."
+    else:
+        text = "🤖 **Bot Privado de Respaldo**\n\n🚫 No tienes permisos autorizados.\n💡 Si eres el Admin Maestro, inicia sesión con: `/login <contraseña>`"
+
+    msg = await safe_reply_message(message, text)
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("mystatus"))
+async def check_my_status(client, message):
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    user_id = message.from_user.id
+    if is_master_admin(user_id):
+        text = f"👑 **Tu Estado:** `ADMIN MAESTRO`\n📍 **Tu ID:** `{user_id}`"
+    elif is_authorized(user_id):
+        text = f"👤 **Tu Estado:** 🔑 `ADMINISTRADOR`\n📍 **Tu ID:** `{user_id}`"
+    else:
+        text = f"👤 **Tu Estado:** 🚫 `USUARIO NO AUTORIZADO`\n📍 **Tu ID:** `{user_id}`\n\n💡 *Para acceder escribe:* `/login <contraseña>`"
+
+    msg = await safe_reply_message(message, text)
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("login"))
+async def login_with_password(client, message):
+    global MASTER_ADMIN_ID
+    user_id = message.from_user.id
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    args = message.text.split()
+    if len(args) < 2:
+        msg = await safe_reply_message(message, "⚠️ **Formato incompleto.**\n\n👉 Usa: `/login <contraseña>`")
+        asyncio.create_task(delete_message_later(message, delay=10))
+        return
+
+    if args[1] == ADMIN_PASSWORD:
+        MASTER_ADMIN_ID = user_id
+        os.environ["MASTER_ADMIN_ID"] = str(user_id)
+        if user_id not in ALLOWED_ADMINS:
+            ALLOWED_ADMINS.append(user_id)
+            cursor.execute("INSERT OR IGNORE INTO allowed_admins (user_id) VALUES (?)", (user_id,))
+            conn.commit()
+        msg = await safe_reply_message(message, "👑 **¡Autenticación Exitosa!**\nAhora eres el **Admin Maestro**.")
+    else:
+        msg = await safe_reply_message(message, "❌ **Contraseña Incorrecta.**\nAcceso denegado.")
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("join"))
+async def join_chat_by_link(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    bot_user = await client.get_me()
+    add_url = f"https://t.me/{bot_user.username}?startgroup=true&admin=post_messages+delete_messages"
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Añadir Bot al Grupo con Permisos", url=add_url)]
+    ])
+
+    msg = await safe_reply_message(
+        message,
+        "⚠️ **Telegram impide que los bots entren solos mediante enlaces.**\n\n"
+        "👉 Presiona el botón de abajo para seleccionar tu grupo e instalar el bot de forma segura:",
+        reply_markup=buttons
+    )
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("relink"))
+async def relink_destination(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    if DESTINATION_CHAT_ID != 0:
+        cursor.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('DESTINATION_CHAT_ID', ?)", (str(DESTINATION_CHAT_ID),))
+        conn.commit()
+        msg = await safe_reply_message(message, f"🔗 **Vínculo Confirmado:** Canal destino `{DESTINATION_CHAT_ID}` verificado y sincronizado en BD.")
+    else:
+        msg = await safe_reply_message(message, "⚠️ No hay un canal destino configurado. Usa `/setdestination <ID>` primero.")
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("cleanram"))
+async def clean_ram_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    collected = gc.collect()
+    ram = psutil.virtual_memory()
+    msg = await safe_reply_message(
+        message, 
+        f"🧹 **Diagnóstico de Recursos:**\n\n"
+        f"• RAM Libre: `{ram.available / (1024**2):.1f} MB` (`{100 - ram.percent:.1f}%`)\n"
+        f"• Recolector de Basura: `{collected}` objetos liberados.\n"
+        f"• Lotes en Cola (`asyncio.Queue`): `{batch_queue.qsize()}`\n"
+        f"• Backoff Actual: `{CURRENT_BACKOFF:.2f}s`\n"
+        f"• SQLite Modo WAL: `Activo`"
+    )
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+def get_db_date_range():
+    cursor.execute("SELECT MIN(created_at), MAX(created_at) FROM videos")
+    row = cursor.fetchone()
+    if row and row[0] and row[1]:
+        return f"📅 **Desde:** `{row[0]}`\n📅 **Hasta:** `{row[1]}`"
+    return "📅 **Rango de Datos:** Sin registros históricos aún."
+
+@app.on_message(filters.command("backup"))
+async def send_db_backup(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]:
+        asyncio.create_task(delete_message_later(message, delay=10))
+
+    create_db_backup()
+    date_info = get_db_date_range()
+    current_hash = get_db_hash(DB_PATH)
+    cap = f"🗄️ **Respaldo de Base de Datos (Hot-Backup)**\n\n🔑 Hash MD5: `{current_hash[:8]}`\n{date_info}\n\n💡 Puedes usar `/restore` respondiendo a este archivo para restaurar."
+    try:
+        await client.send_document(chat_id=message.from_user.id, document=DB_PATH, caption=cap)
+        if message.chat.type in ["group", "supergroup"]:
+            msg = await safe_reply_message(message, "📬 **Respaldo enviado a tu chat privado.**")
+            asyncio.create_task(delete_message_later(msg, delay=10))
+    except Exception as e:
+        await send_error_alert(client, "send_db_backup", e)
+        msg = await safe_reply_message(message, f"🔴 Error al enviar respaldo: `{e}`")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("restore") & filters.private)
+async def restore_db_backup_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+
+    doc = message.reply_to_message.document if message.reply_to_message else message.document
+    if not doc or not doc.file_name.endswith(".db"):
+        await message.reply_text("⚠️ Adjunta o responde a un archivo `.db` válido con el comando `/restore`.")
+        return
+
+    msg = await message.reply_text("🔄 **Descargando y restaurando base de datos...**")
+    try:
+        conn.close()
+        await client.download_media(doc.file_id, file_name=DB_PATH)
+        create_db_backup()
+        await msg.edit_text("✅ **Base de datos restaurada correctamente.** Reiniciando el bot...")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    except Exception as e:
+        await send_error_alert(client, "restore_db_backup", e)
+        await msg.edit_text(f"🔴 Error durante la restauración: `{e}`")
+
+async def auto_daily_backup_worker(client):
+    while True:
+        await asyncio.sleep(86400)
+        await backup_db_if_changed(client, reason="Respaldo diario programado")
+# --- CORE DE ESCANEO DE HISTORIAL DE VIDEO EN TIEMPO REAL CON CHECKPOINT Y RE-SCAN FORZADO ---
+async def execute_scan_logic(client, message, force_full=False):
+    group_id = message.chat.id
+    bot_is_admin = await is_bot_admin_in_chat(client, group_id)
+
+    if group_id in active_scans:
+        msg = await safe_reply_message(message, "⚠️ **Un escaneo ya está en progreso en este grupo.**")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+        return
+
+    active_scans.add(group_id)
+    create_db_backup()
+
+    try:
+        top_msg = message.id
+        if force_full:
+            start_point = top_msg
+        else:
+            cursor.execute("SELECT last_message_id FROM scan_checkpoint WHERE group_id = ?", (group_id,))
+            cp_row = cursor.fetchone()
+            start_point = cp_row[0] if cp_row else top_msg
+
+        total_estimated = max(1, start_point)
+        current_id = start_point
+
+        status_msg = None
+        if bot_is_admin:
+            status_msg = await safe_reply_message(
+                message,
+                f"📊 **Escaneo de Historial Iniciado**\n\n"
+                f"📹 Videos analizados: **0 de {total_estimated} (0%)**\n"
+                f"⚠️ Clones detectados: **0**\n"
+                f"📍 Punto de control: `ID {current_id}`"
+            )
+
+        total_scanned = 0
+        duplicates_found = 0
+        last_update_time = time.time()
+        batch_size = 100
+
+        while current_id > 1:
+            ids_to_fetch = list(range(max(1, current_id - batch_size), current_id))
+            if not ids_to_fetch:
+                break
+
+            try:
+                fetched_messages = await client.get_messages(group_id, ids_to_fetch)
+            except Exception:
+                await asyncio.sleep(1)
+                current_id -= batch_size
+                continue
+
+            for msg in reversed(fetched_messages):
+                if not msg or msg.empty:
+                    continue
+
+                current_id = msg.id
+                cursor.execute("INSERT OR REPLACE INTO scan_checkpoint (group_id, last_message_id) VALUES (?, ?)", (group_id, current_id))
+                conn.commit()
+
+                if msg.video:
+                    total_scanned += 1
+                    v_unique_id = msg.video.file_unique_id
+                    v_size = msg.video.file_size
+                    v_dur = msg.video.duration
+                    v_hash = None
+
+                    if msg.video.thumbs:
+                        try:
+                            thumb_p = await custom_download_media(client, msg.video.thumbs[0].file_id, f"thumb_{msg.id}.jpg", chat_id=group_id)
+                            if thumb_p and not is_low_entropy_image(thumb_p):
+                                with Image.open(thumb_p) as img:
+                                    v_hash = str(imagehash.phash(img))
+                            if thumb_p and os.path.exists(thumb_p):
+                                os.remove(thumb_p)
+                        except Exception:
+                            pass
+
+                    is_clon, level = check_multipoint_duplicate(group_id, v_unique_id, v_size, v_dur, v_hash)
+                    if is_clon:
+                        duplicates_found += 1
+                        if bot_is_admin:
+                            add_to_deletion_queue(group_id, msg.id)
+                    else:
+                        if v_hash:
+                            cursor.execute("INSERT OR IGNORE INTO videos (phash, group_id, file_unique_id, file_size, duration) VALUES (?, ?, ?, ?, ?)",
+                                           (v_hash, group_id, v_unique_id, v_size, v_dur))
+                            conn.commit()
+
+            if bot_is_admin and status_msg and (time.time() - last_update_time > 5):
+                last_update_time = time.time()
+                analyzed_count = total_estimated - current_id
+                pct = int((analyzed_count / total_estimated) * 100) if total_estimated > 0 else 0
+                pct = max(0, min(100, pct))
+                try:
+                    await status_msg.edit_text(
+                        f"📊 **Escaneo de Historial en Progreso**\n\n"
+                        f"📹 Videos analizados: **{analyzed_count} de {total_estimated} ({pct}%)**\n"
+                        f"⚠️ Clones detectados: **{duplicates_found}**\n"
+                        f"📍 Punto de control: `ID {current_id}`"
+                    )
+                except Exception:
+                    pass
+
+        if bot_is_admin and status_msg:
+            await status_msg.edit_text(
+                f"✅ **Escaneo de Historial Completado**\n\n"
+                f"📹 Total analizados: **{total_scanned}**\n"
+                f"🗑️ Clones detectados/eliminados: **{duplicates_found}**"
+            )
+            asyncio.create_task(delete_message_later(status_msg, delay=10))
+
+        await backup_db_if_changed(client, reason=f"Escaneo /scan completado en {group_id}")
+
+    except Exception as e:
+        await send_error_alert(client, "execute_scan_logic", e)
+    finally:
+        active_scans.discard(group_id)
+
+@app.on_message(filters.command("scan") & filters.group)
+async def scan_cmd_handler(client, message):
+    if not is_authorized(message.from_user.id): return
+    asyncio.create_task(delete_message_later(message, delay=10))
+    await execute_scan_logic(client, message, force_full=False)
+
+@app.on_message(filters.command("scan_full") & filters.group)
+async def scan_full_confirmation_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    asyncio.create_task(delete_message_later(message, delay=10))
+
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Aceptar", callback_data=f"confirm_scanfull:{message.from_user.id}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_scanfull:{message.from_user.id}")
+        ]
+    ])
+    msg = await safe_reply_message(
+        message, 
+        "⚠️ **¿Confirmas re-analizar todo el historial de este chat?**\n\nEsta acción ignorará los checkpoints guardados previamente.",
+        reply_markup=buttons
+    )
+    if msg:
+        asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_callback_query(filters.regex(r"^(confirm_scanfull|cancel_scanfull):"))
+async def scan_full_callback_handler(client, callback_query):
+    action, user_id_str = callback_query.data.split(":")
+    if callback_query.from_user.id != int(user_id_str):
+        await callback_query.answer("⚠️ Solo la persona que ejecutó /scan_full puede responder.", show_alert=True)
+        return
+
+    if action == "confirm_scanfull":
+        await callback_query.answer("Iniciando escaneo completo...")
+        await callback_query.message.delete()
+        await execute_scan_logic(client, callback_query.message, force_full=True)
+    else:
+        await callback_query.answer("Escaneo cancelado.")
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+
+# --- PROCESAMIENTO E INSPECCIÓN INDIVIDUAL Y AGRUPADA ---
+async def process_single_video_data(client, message, bot_is_admin):
+    user_id = message.from_user.id if message.from_user else 0
+    group_id = message.chat.id
+    file_path = None
+    
+    try:
+        v_unique_id = message.video.file_unique_id
+        v_size = message.video.file_size
+        v_dur = message.video.duration
+        v_hash = None
+
+        if message.video.thumbs:
+            file_path = await custom_download_media(client, message.video.thumbs[0].file_id, f"thumb_{message.id}.jpg", chat_id=group_id)
+            if file_path and not is_low_entropy_image(file_path):
+                with Image.open(file_path) as img:
+                    v_hash = str(imagehash.phash(img))
+            elif file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                file_path = None
+
+        if not v_hash:
+            file_path = await custom_download_media(client, message.video.file_id, f"vid_{message.id}.mp4", chat_id=group_id)
+            if file_path:
+                v_hash = extract_phash_from_frame(file_path)
+
+        is_clon, level = check_multipoint_duplicate(group_id, v_unique_id, v_size, v_dur, v_hash)
+
+        if is_clon:
+            if bot_is_admin:
+                add_to_deletion_queue(group_id, message.id)
+            return "duplicate", (message.from_user.mention if message.from_user else f"ID {user_id}", level)
+        else:
+            return "valid", (v_hash, group_id, v_unique_id, v_size, v_dur, user_id)
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+async def process_video_batch(client, messages):
+    async with processing_semaphore:
+        if not messages:
+            return 0, 0, []
+
+        group_id = messages[0].chat.id
+        group_title = messages[0].chat.title or ""
+        bot_is_admin = await is_bot_admin_in_chat(client, group_id)
+
+        valid_messages = []
+        records_to_insert = []
+        user_stats_map = {}
+        detected_clones = []
+
+        for msg in messages:
+            status, data = await process_single_video_data(client, msg, bot_is_admin)
+            if status == "duplicate":
+                detected_clones.append(data)
+            elif status == "valid":
+                valid_messages.append(msg)
+                records_to_insert.append(data)
+
+        if not valid_messages:
+            return 0, len(detected_clones), detected_clones
+
+        saved_count = 0
+        try:
+            if len(valid_messages) > 1:
+                media_group = [InputMediaVideo(media=m.video.file_id, caption=m.caption or "") for m in valid_messages]
+                start_t = time.time()
+                await client.send_media_group(chat_id=DESTINATION_CHAT_ID, media=media_group)
+                await adjust_backoff(time.time() - start_t)
+                saved_count = len(valid_messages)
+            else:
+                copied = await safe_copy_message(client, valid_messages[0], DESTINATION_CHAT_ID)
+                if copied:
+                    saved_count = 1
+
+        except Exception as batch_error:
+            await send_error_alert(client, "process_video_batch (Fallback Individual)", batch_error)
+            for idx, msg in enumerate(valid_messages):
+                copied = await safe_copy_message(client, msg, DESTINATION_CHAT_ID)
+                if copied:
+                    saved_count += 1
+                    rec = records_to_insert[idx]
+                    cursor.execute("INSERT INTO videos (phash, group_id, file_unique_id, file_size, duration) VALUES (?, ?, ?, ?, ?)", rec[:5])
+                    if rec[5] != 0:
+                        cursor.execute("""
+                        INSERT INTO user_stats (user_id, group_id, video_count) VALUES (?, ?, 1)
+                        ON CONFLICT(user_id, group_id) DO UPDATE SET video_count = video_count + 1
+                        """, (rec[5], rec[1]))
+                    conn.commit()
+
+        if saved_count > 0 and saved_count == len(valid_messages):
+            for rec in records_to_insert:
+                cursor.execute("INSERT INTO videos (phash, group_id, file_unique_id, file_size, duration) VALUES (?, ?, ?, ?, ?)", rec[:5])
+                u_id, g_id = rec[5], rec[1]
+                if u_id != 0:
+                    user_stats_map[(u_id, g_id)] = user_stats_map.get((u_id, g_id), 0) + 1
+
+            for (u_id, g_id), count in user_stats_map.items():
+                cursor.execute("""
+                INSERT INTO user_stats (user_id, group_id, video_count) VALUES (?, ?, ?)
+                ON CONFLICT(user_id, group_id) DO UPDATE SET video_count = video_count + ?
+                """, (u_id, g_id, count, count))
+
+            conn.commit()
+
+        if saved_count > 0:
+            await update_backup_channel_counter(client, saved_count, group_title)
+
+        gc.collect()
+        return saved_count, len(detected_clones), detected_clones
+
+# --- WORKER CONSUMIDOR DE LA COLA FIFO (asyncio.Queue) ---
+async def worker_process_batch_queue(client):
+    while True:
+        try:
+            messages = await batch_queue.get()
+            if not messages:
+                batch_queue.task_done()
+                continue
+
+            first_msg = messages[0]
+            bot_is_admin = await is_bot_admin_in_chat(client, first_msg.chat.id)
+
+            saved_count, dup_count, detected_clones = await process_video_batch(client, messages)
+
+            if bot_is_admin:
+                if dup_count > 0:
+                    summary_alert = (
+                        f"🚨 **¡Video(s) Duplicado(s) Detectado(s)!**\n\n"
+                        f"⚠️ **Cantidad de Clones:** `{dup_count}`\n"
+                        f"🗑️ *Los videos han sido borrados automáticamente para evitar duplicados.*"
+                    )
+                    msg_dup = await safe_reply_message(first_msg, summary_alert)
+                    if msg_dup:
+                        asyncio.create_task(delete_message_later(msg_dup, delay=10))
+
+                if saved_count > 0:
+                    msg_ok = await safe_reply_message(first_msg, f"✅ **Procesado(s):** {saved_count} video(s).")
+                    if msg_ok:
+                        asyncio.create_task(delete_message_later(msg_ok, delay=10))
+
+            batch_queue.task_done()
+        except Exception as e:
+            await send_error_alert(client, "worker_process_batch_queue", e)
+            await asyncio.sleep(2)
+
+@app.on_message(filters.video & filters.group)
+async def handle_video_entry(client, message):
+    user_id = message.from_user.id if message.from_user else 0
+    max_items, max_bytes = get_ram_limits()
+
+    async with buffer_locks:
+        if user_id not in user_buffers:
+            user_buffers[user_id] = {"messages": [], "total_bytes": 0, "task": None}
+        
+        buf = user_buffers[user_id]
+        v_size = message.video.file_size or 0
+
+        buf["messages"].append(message)
+        buf["total_bytes"] += v_size
+
+        if (len(buf["messages"]) >= max_items) or (buf["total_bytes"] >= max_bytes):
+            if buf["task"]: 
+                buf["task"].cancel()
+            buffer_data = user_buffers.pop(user_id)
+            asyncio.create_task(batch_queue.put(buffer_data["messages"]))
+        else:
+            if buf["task"]: 
+                buf["task"].cancel()
+            buf["task"] = asyncio.create_task(flush_user_buffer_delayed(client, user_id, delay=4.5))
+
+async def flush_user_buffer_delayed(client, user_id, delay=4.5):
+    if delay > 0: 
+        await asyncio.sleep(delay)
+    async with buffer_locks:
+        buffer_data = user_buffers.pop(user_id, None)
+        
+    if not buffer_data or not buffer_data["messages"]: 
+        return
+
+    await batch_queue.put(buffer_data["messages"])
+# --- MANTENIMIENTO PERIÓDICO ---
+async def safe_db_cleanup_worker(client):
+    while True:
+        await asyncio.sleep(172800)
+        try:
+            create_db_backup()
+            cursor.execute("DELETE FROM videos WHERE created_at < datetime('now', '-90 days')")
+            
+            cursor.execute("SELECT DISTINCT group_id FROM videos")
+            groups = cursor.fetchall()
+            for (g_id,) in groups:
+                try:
+                    await client.get_chat(g_id)
+                except (RPCError, PeerIdInvalid, ValueError):
+                    cursor.execute("DELETE FROM videos WHERE group_id = ?", (g_id,))
+                    cursor.execute("DELETE FROM user_stats WHERE group_id = ?", (g_id,))
+            
+            conn.commit()
+            cursor.execute("VACUUM")
+        except Exception as e:
+            await send_error_alert(client, "safe_db_cleanup_worker", e)
+
+# --- OTROS COMANDOS DE CONSULTA ---
+@app.on_message(filters.command("stats") & filters.group)
+async def group_stats_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    asyncio.create_task(delete_message_later(message, delay=10))
+
+    group_id = message.chat.id
+    cursor.execute("""
+    SELECT user_id, video_count FROM user_stats 
+    WHERE group_id = ? ORDER BY video_count DESC LIMIT 10
+    """, (group_id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        msg = await safe_reply_message(message, "📊 **Estadísticas:** Sin envíos registrados aún en este grupo.")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+        return
+
+    stats_text = "📊 **Top Aportadores de Videos en este Grupo:**\n\n"
+    for idx, (u_id, count) in enumerate(rows, start=1):
+        badge = get_user_badge(count)
+        stats_text += f"{idx}. ID `{u_id}` — **{count}** videos [{badge}]\n"
+
+    msg = await safe_reply_message(message, stats_text)
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("adminlist"))
+async def list_admins_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    text = f"👑 **Admin Maestro ID:** `{MASTER_ADMIN_ID}`\n\n🔑 **Admins Autorizados:**\n"
+    for a_id in ALLOWED_ADMINS:
+        text += f"• `{a_id}`\n"
+
+    try:
+        await client.send_message(chat_id=message.from_user.id, text=text)
+        if message.chat.type in ["group", "supergroup"]:
+            msg = await safe_reply_message(message, "📬 **Lista de Admins enviada a tu privado.**")
+            asyncio.create_task(delete_message_later(msg, delay=10))
+    except Exception:
+        msg = await safe_reply_message(message, "⚠️ Escríbeme primero al privado para enviarte la lista.")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("id"))
+async def get_ids_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    text = f"👤 **Tu ID:** `{message.from_user.id}`\n💬 **ID del Chat:** `{message.chat.id}`"
+    try:
+        await client.send_message(chat_id=message.from_user.id, text=text)
+    except Exception:
+        msg = await safe_reply_message(message, text)
+        asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("checkbackup"))
+async def check_backup_status(client, message):
+    if not is_master_admin(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    if not DESTINATION_CHAT_ID:
+        msg = await safe_reply_message(message, "⚠️ No hay un grupo de respaldo configurado. Usa `/setdestination <ID>`")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+        return
+
+    try:
+        await client.send_message(DESTINATION_CHAT_ID, "🧪 **Prueba de Verificación:** Conexión correcta.")
+        msg = await safe_reply_message(message, f"✅ **Verificación Exitosa:** Grupo `{DESTINATION_CHAT_ID}` respondiendo.")
+    except Exception as e:
+        await send_error_alert(client, "check_backup_status", e)
+        msg = await safe_reply_message(message, f"🔴 **Error de Respaldo:** `{e}`")
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("removeadmin"))
+async def remove_admin_menu(client, message):
+    if not is_master_admin(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    other_admins = [a_id for a_id in ALLOWED_ADMINS if a_id != message.from_user.id]
+    if not other_admins:
+        msg = await safe_reply_message(message, "ℹ️ No hay otros administradores para remover.")
+        asyncio.create_task(delete_message_later(msg, delay=10))
+        return
+
+    buttons = [[InlineKeyboardButton(f"❌ Revocar ID: {a_id}", callback_data=f"ask_revoke:{a_id}")] for a_id in other_admins]
+    msg = await safe_reply_message(message, "👑 **Gestión de Permisos:** Selecciona el administrador a revocar:", reply_markup=InlineKeyboardMarkup(buttons))
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_callback_query(filters.regex(r"^(ask_revoke|confirm_revoke|cancel_revoke):"))
+async def handle_revoke_callbacks(client, callback_query):
+    if not is_master_admin(callback_query.from_user.id):
+        await callback_query.answer("⚠️ Solo el Admin Maestro puede quitar permisos.", show_alert=True)
+        return
+
+    action, target_id_str = callback_query.data.split(":")
+    target_id = int(target_id_str)
+
+    if action == "ask_revoke":
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Sí, quitar permisos", callback_data=f"confirm_revoke:{target_id}"),
+                InlineKeyboardButton("❌ No, cancelar", callback_data=f"cancel_revoke:{target_id}")
+            ]
+        ])
+        await callback_query.message.edit_text(f"⚠️ **¿Confirmas revocar la ID `{target_id}`?**", reply_markup=buttons)
+    elif action == "cancel_revoke":
+        await callback_query.answer("Acción cancelada.")
+        try: await callback_query.message.delete()
+        except Exception: pass
+    elif action == "confirm_revoke":
+        if target_id in ALLOWED_ADMINS:
+            ALLOWED_ADMINS.remove(target_id)
+            cursor.execute("DELETE FROM allowed_admins WHERE user_id = ?", (target_id,))
+            conn.commit()
+            await callback_query.answer("Permisos revocados.", show_alert=True)
+            await callback_query.message.edit_text(f"✅ **Permisos revocados para:** `{target_id}`")
+
+@app.on_message(filters.command("addadmin"))
+async def add_admin_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    args = message.text.split()
+    if len(args) < 2:
+        msg = await safe_reply_message(message, "⚠️ **Formato:** `/addadmin <USER_ID>`")
+        asyncio.create_task(delete_message_later(message, delay=10))
+        return
+
+    try:
+        new_id = int(args[1])
+        if new_id not in ALLOWED_ADMINS:
+            ALLOWED_ADMINS.append(new_id)
+            cursor.execute("INSERT OR IGNORE INTO allowed_admins (user_id) VALUES (?)", (new_id,))
+            conn.commit()
+            msg = await safe_reply_message(message, f"✅ **Nueva ID autorizada:** `{new_id}`")
+        else:
+            msg = await safe_reply_message(message, "ℹ️ Esa ID ya estaba autorizada.")
+    except ValueError:
+        msg = await safe_reply_message(message, "🔴 **Error:** La ID debe ser numérica.")
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("setdestination"))
+async def set_destination_id(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    global DESTINATION_CHAT_ID
+    args = message.text.split()
+    if len(args) < 2:
+        msg = await safe_reply_message(message, "⚠️ **Formato:** `/setdestination <ID_CANAL>`")
+        asyncio.create_task(delete_message_later(message, delay=10))
+        return
+
+    try:
+        new_id = int(args[1])
+        DESTINATION_CHAT_ID = new_id
+        os.environ["DESTINATION_CHAT_ID"] = str(new_id)
+        cursor.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('DESTINATION_CHAT_ID', ?)", (str(new_id),))
+        conn.commit()
+        msg = await safe_reply_message(message, f"✅ **ID de respaldo actualizada a:** `{DESTINATION_CHAT_ID}`")
+    except ValueError:
+        msg = await safe_reply_message(message, "🔴 **Error:** La ID debe ser numérica.")
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command(["help", "ayuda"]))
+async def show_commands(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    user_id = message.from_user.id
+    commands_text = "🤖 **Menú de Administrador**\n\n"
+    if is_master_admin(user_id):
+        commands_text += "👑 **Admin Maestro:**\n• `/checkbackup` — Probar canal destino\n• `/removeadmin` — Eliminar permisos\n\n"
+
+    commands_text += (
+        "• `/mystatus` — Tus permisos\n"
+        "• `/login <pass>` — Iniciar sesión Maestro\n"
+        "• `/join` — Añadir bot a un grupo (Seguro)\n"
+        "• `/stats` — Reporte del grupo\n"
+        "• `/scan` — Escaneo de historial en el grupo\n"
+        "• `/scan_full` — Re-escanear todo (ignora checkpoints)\n"
+        "• `/scanremoto` — Escaneo de multimedia a control remoto\n"
+        "• `/salir` — Abandonar un grupo a control remoto\n"
+        "• `/backup` — Descargar BD (.db)\n"
+        "• `/restore` — Restaurar BD\n"
+        "• `/cleanram` — Limpieza y diagnóstico de RAM\n"
+        "• `/relink` — Confirmar canal respaldo\n"
+        "• `/addadmin <ID>` — Autorizar usuario\n"
+        "• `/adminlist` — Lista de Admins (MD)\n"
+        "• `/botstatus` — Diagnóstico\n"
+        "• `/id` — Ver IDs (MD)\n"
+        "• `/setdestination <ID>` — Cambiar canal destino\n"
+        "• `/reiniciar` — Reiniciar servicio"
+    )
+    msg = await safe_reply_message(message, commands_text)
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("botstatus"))
+async def bot_status_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    ram = psutil.virtual_memory()
+    cursor.execute("SELECT COUNT(*) FROM videos")
+    total_vids = cursor.fetchone()[0]
+
+    status_text = (
+        "🤖 **Diagnóstico de Estado del Bot**\n\n"
+        f"• RAM Disponible: `{ram.available / (1024**2):.1f} MB` (`{100 - ram.percent:.1f}%`)\n"
+        f"• Total Registros de Video: `{total_vids}`\n"
+        f"• Lotes Pendientes en Cola: `{batch_queue.qsize()}`\n"
+        f"• Backoff Actual: `{CURRENT_BACKOFF:.2f}s`\n"
+        f"• Canal Destino: `{DESTINATION_CHAT_ID}`\n"
+        f"• SQLite WAL: `Activo`"
+    )
+    msg = await safe_reply_message(message, status_text)
+    asyncio.create_task(delete_message_later(msg, delay=10))
+
+@app.on_message(filters.command("reiniciar"))
+async def restart_cmd(client, message):
+    if not is_authorized(message.from_user.id): return
+    if message.chat.type in ["group", "supergroup"]: asyncio.create_task(delete_message_later(message, delay=10))
+
+    msg = await safe_reply_message(message, "🔄 **Reiniciando el bot...**")
+    await asyncio.sleep(2)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+# --- INICIALIZACIÓN GENERAL DE SERVICIOS ---
+async def main():
+    await start_web_server()
+    await app.start()
+    
+    # Iniciar también el UserBot si está configurado
+    if user_bot:
+        try:
+            await user_bot.start()
+            print("👤 UserBot híbrido iniciado correctamente con session string.")
+        except Exception as e:
+            print(f"⚠️ Error al iniciar el UserBot: {e}")
+
+    await set_menu_commands(app)
+    
+    # Autorecuperación de la DB si es un despliegue fresco
+    await auto_restore_db_on_startup(app)
+    
+    # Workers en segundo plano
+    asyncio.create_task(worker_process_batch_queue(app))
+    asyncio.create_task(worker_process_deletion_queue(app))
+    asyncio.create_task(auto_daily_backup_worker(app))
+    asyncio.create_task(safe_db_cleanup_worker(app))
+    
+    print("🤖 Bot iniciado con cola FIFO asyncio.Queue, Semaphore(1) y módulos remotos activos...")
+    await idle()
+    
+    await app.stop()
+    if user_bot:
+        await user_bot.stop()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
